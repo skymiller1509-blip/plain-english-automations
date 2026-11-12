@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plain-English Automations — Reactive</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 600; }
+  input, textarea { width: 100%; padding: 0.5rem; font-size: 1rem; box-sizing: border-box; }
+  button { margin-top: 1rem; padding: 0.7rem 1.2rem; font-size: 1rem; cursor: pointer; }
+  button.primary { background: #111; color: #fff; border: none; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #status, #parsed { margin-top: 1.5rem; padding: 1rem; background: #f4f4f4; border-radius: 8px; white-space: pre-wrap; }
+  .hint { color: #555; font-size: 0.9rem; }
+  .warn { color: #a00; font-weight: 600; }
+  .ok { color: #0a0; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Plain-English Automations</h1>
+<p>Type a rule in plain words. A real AI reads it, turns it into settings,
+and a Reactive contract carries it out on its own. No server, no manual click.</p>
+<p class="hint">Example: <em>"if ETH drops 10%, move to USDC"</em>. The AI runs
+<strong>live in this page</strong> through Firebase AI Logic (Gemini) — it is
+part of the running app, not a tool used to build it. You check the settings
+it understood before anything is saved on-chain.</p>
+
+<h2>1. Connect</h2>
+<button id="connectBtn">Connect wallet</button>
+<p id="account" class="hint">Not connected.</p>
+
+<h2>2. Say it in plain English</h2>
+<label for="ruleText">Your rule</label>
+<textarea id="ruleText" rows="2" placeholder="if ETH drops 10%, move to USDC"></textarea>
+<button id="parseBtn" class="primary">Ask the AI what this means</button>
+<p class="hint">This sends only your sentence to Gemini, live, and shows you the
+settings it understood. Nothing is saved yet.</p>
+<div id="parsed">No rule parsed yet.</div>
+
+<h2>3. Save the rule</h2>
+<p class="hint">Two steps, both need your wallet: first the vault on
+<strong>Base Sepolia</strong> (chain 84532), then the watcher on
+<strong>Lasna</strong> (chain 5318007). The vault reads the live Chainlink
+price itself and records it as the baseline, so the rule is always measured
+from a real price.</p>
+<button id="saveVaultBtn" class="primary" disabled>Save rule on the vault (Base Sepolia)</button>
+<button id="saveRuleBtn" disabled>Mirror rule on the watcher (Lasna)</button>
+
+<h2>4. Deposit</h2>
+<p class="hint">The money the rule moves when it fires. Keep a little extra in
+the vault: the callback that carries the rule out is billed to the vault in ETH.</p>
+<label for="amount">Deposit amount (ETH on Base Sepolia)</label>
+<input id="amount" type="number" min="0" step="0.001" value="0.01">
+<button id="depositBtn" disabled>Deposit</button>
+
+<h2>5. Status</h2>
+<button id="refreshBtn" disabled>Refresh status</button>
+<div id="status">Connect your wallet to see the status.</div>
+
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-app.js";
+import { getAI, getGenerativeModel, GoogleAIBackend } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-ai.js";
+import { initializeAppCheck, ReCaptchaEnterpriseProvider } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-app-check.js";
+
+// ---- Firebase config (public web identifiers, from the Privacy Firewall
+// project privacy-firewall-583a4 — already published in a public repo).
+// No API key lives here: Firebase AI Logic keeps the Gemini key server-side
+// behind the Firebase proxy. ----
+const firebaseConfig = {
+  apiKey: "AIzaSyAK7OWxYjmtzihUeABVjogOk7XK4X9nzqg",
+  authDomain: "privacy-firewall-583a4.firebaseapp.com",
+  projectId: "privacy-firewall-583a4",
+  storageBucket: "privacy-firewall-583a4.firebasestorage.app",
+  messagingSenderId: "840375627222",
+  appId: "1:840375627222:web:878fe62359c121b30b8877",
+  measurementId: "G-17GK4MN5GC",
+};
+const appCheckSiteKey = "6LdDIxouAAAAADcc9HVpaitcDt7MdTWk65PQdvej";
+
+// ---- Fill these in after the testnet deploy (see script/Deploy*.s.sol) ----
+const VAULT_ADDRESS = "0x1f5fd7319e2204dd6f7a5b60e0108b60b992db50"; // Base Sepolia
+const RULE_ADDRESS = "0x97fcd301f901f130c9e8aa77b92cc8c1be091949"; // Lasna
+const FEED_ADDRESS = "0x4aDC67696bA383F43DD60A9e78F2C97Fbbfc7cb1"; // Chainlink ETH/USD, Base Sepolia
+const BASE_SEPOLIA_CHAIN_ID = 84532n;
+const LASNA_CHAIN_ID = 5318007n;
+
+const VAULT_ABI = [
+  "function owner() view returns (address)",
+  "function direction() view returns (uint8)",
+  "function thresholdBps() view returns (uint256)",
+  "function baselinePrice() view returns (int256)",
+  "function ruleSet() view returns (bool)",
+  "function executed() view returns (bool)",
+  "function currentPrice() view returns (int256)",
+  "function isTriggered() view returns (bool)",
+  "function moveBps() view returns (int256)",
+  "function deposit() payable",
+  "function setRule(uint8,uint256)",
+];
+const RULE_ABI = [
+  "function direction() view returns (uint8)",
+  "function thresholdBps() view returns (uint256)",
+  "function baselinePrice() view returns (int256)",
+  "function lastPrice() view returns (int256)",
+  "function executed() view returns (bool)",
+  "function setRule(uint8,uint256,int256)",
+];
+const FEED_ABI = [
+  "function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)",
+  "function decimals() view returns (uint8)",
+];
+
+const $ = (id) => document.getElementById(id);
+let provider, signer, vault, rule;
+let parsedRule = null;
+
+// --- Firebase AI Logic (live, at runtime) ---------------------------------
+const app = initializeApp(firebaseConfig);
+if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
+  self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
+}
+initializeAppCheck(app, {
+  provider: new ReCaptchaEnterpriseProvider(appCheckSiteKey),
+  isTokenAutoRefreshEnabled: true,
+});
+const ai = getAI(app, { backend: new GoogleAIBackend() });
+
+$("parseBtn").onclick = async () => {
+  const text = $("ruleText").value.trim();
+  if (!text) { alert("Type a rule first."); return; }
+  $("parsed").textContent = "Asking the AI…";
+  try {
+    const model = getGenerativeModel(ai, {
+      model: "gemini-2.0-flash",
+      generationConfig: { responseMimeType: "application/json" },
+    });
+    const prompt =
+      "You turn a plain-English trading rule into exact settings. " +
+      "Reply with ONLY a JSON object, no other text, with these fields: " +
+      '{"asset": "ETH", "condition": "drop" or "rise", ' +
+      '"thresholdPercent": number, "action": "move_to_usdc", "targetToken": "USDC"}. ' +
+      "Rules: asset is always ETH for this app. condition is \"drop\" when the user " +
+      "says the price falls/drops/dips/crashes, \"rise\" when it climbs/rises/pumps. " +
+      "thresholdPercent is the number in the sentence (\"10%\" -> 10). " +
+      "If the sentence has no number, use 10. If the sentence is not a price rule " +
+      "at all, reply {\"error\": \"not a price rule\"}.\n\nRule: " + text;
+    const result = await model.generateContent(prompt);
+    const json = JSON.parse(result.response.text());
+    if (json.error) {
+      $("parsed").textContent = "The AI could not read that as a price rule. Try something like: if ETH drops 10%, move to USDC";
+      parsedRule = null;
+      $("saveVaultBtn").disabled = true;
+      return;
+    }
+    if (json.asset !== "ETH" || (json.condition !== "drop" && json.condition !== "rise") ||
+        !(json.thresholdPercent > 0 && json.thresholdPercent < 100) ||
+        json.action !== "move_to_usdc") {
+      $("parsed").textContent = "The AI gave back settings this app cannot use:\n" + JSON.stringify(json, null, 2);
+      parsedRule = null;
+      $("saveVaultBtn").disabled = true;
+      return;
+    }
+    parsedRule = json;
+    $("parsed").textContent =
+      "The AI understood:\n" +
+      "Asset: " + json.asset + "\n" +
+      "Condition: price " + (json.condition === "drop" ? "drops" : "rises") + " by " + json.thresholdPercent + "%\n" +
+      "Action: move to " + json.targetToken + "\n\n" +
+      "Check this before saving. If it is wrong, reword your sentence and ask again.";
+    if (signer) $("saveVaultBtn").disabled = false;
+  } catch (err) {
+    $("parsed").textContent = "AI error: " + (err && err.message ? err.message : String(err));
+  }
+};
+
+// --- Wallet + contracts -----------------------------------------------------
+$("connectBtn").onclick = async () => {
+  if (!window.ethereum) { alert("No wallet found. Install MetaMask or similar."); return; }
+  provider = new ethers.BrowserProvider(window.ethereum);
+  await provider.send("eth_requestAccounts", []);
+  signer = await provider.getSigner();
+  $("account").textContent = "Connected: " + await signer.getAddress();
+  $("depositBtn").disabled = false;
+  $("refreshBtn").disabled = false;
+  if (parsedRule) $("saveVaultBtn").disabled = false;
+  if (VAULT_ADDRESS !== "0x0000000000000000000000000000000000000000") {
+    vault = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, signer);
+    rule = new ethers.Contract(RULE_ADDRESS, RULE_ABI, signer);
+    refreshStatus();
+  }
+};
+
+async function needChain(chainId, name) {
+  const net = await provider.getNetwork();
+  if (net.chainId !== chainId) {
+    alert("Switch your wallet to " + name + " first.");
+    return false;
+  }
+  return true;
+}
+
+$("saveVaultBtn").onclick = async () => {
+  if (!parsedRule || !vault) return;
+  if (!(await needChain(BASE_SEPOLIA_CHAIN_ID, "Base Sepolia (chain 84532)"))) return;
+  const direction = parsedRule.condition === "drop" ? 0 : 1;
+  const thresholdBps = Math.round(parsedRule.thresholdPercent * 100);
+  const tx = await vault.setRule(direction, thresholdBps);
+  $("status").textContent = "Saving rule on the vault… tx: " + tx.hash;
+  await tx.wait();
+  $("saveRuleBtn").disabled = false;
+  refreshStatus();
+};
+
+$("saveRuleBtn").onclick = async () => {
+  if (!parsedRule || !rule || !vault) return;
+  if (!(await needChain(LASNA_CHAIN_ID, "Lasna (chain 5318007)"))) return;
+  const [direction, thresholdBps, baseline] = await Promise.all([
+    vault.direction(), vault.thresholdBps(), vault.baselinePrice(),
+  ]);
+  const tx = await rule.setRule(direction, thresholdBps, baseline);
+  $("status").textContent = "Mirroring rule on the watcher… tx: " + tx.hash;
+  await tx.wait();
+  refreshStatus();
+};
+
+$("depositBtn").onclick = async () => {
+  if (!vault) { alert("No vault yet — fill in VAULT_ADDRESS after deploy."); return; }
+  if (!(await needChain(BASE_SEPOLIA_CHAIN_ID, "Base Sepolia (chain 84532)"))) return;
+  const tx = await vault.deposit({ value: ethers.parseEther($("amount").value) });
+  $("status").textContent = "Depositing… tx: " + tx.hash;
+  await tx.wait();
+  refreshStatus();
+};
+
+async function refreshStatus() {
+  if (!vault) { $("status").textContent = "No vault address set yet."; return; }
+  const readOnly = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, provider);
+  const feed = new ethers.Contract(FEED_ADDRESS, FEED_ABI, provider);
+  const [direction, thresholdBps, baseline, ruleSet, executed, triggered, moveBps] = await Promise.all([
+    readOnly.direction(), readOnly.thresholdBps(), readOnly.baselinePrice(),
+    readOnly.ruleSet(), readOnly.executed(), readOnly.isTriggered(), readOnly.moveBps(),
+  ]);
+  const [, livePrice] = await feed.latestRoundData();
+  const bal = await provider.getBalance(VAULT_ADDRESS);
+  const fmtPrice = (p) => "$" + (Number(p) / 1e8).toFixed(2);
+  $("status").textContent =
+    "Rule set: " + (ruleSet ? "yes" : "no") +
+    (ruleSet ? "\nRule: ETH " + (direction === 0 ? "drops" : "rises") + " " + (Number(thresholdBps) / 100) + "%" : "") +
+    (ruleSet ? "\nBaseline price: " + fmtPrice(baseline) : "") +
+    "\nLive price: " + fmtPrice(livePrice) +
+    (ruleSet ? "\nMove from baseline: " + (Number(moveBps) / 100).toFixed(2) + "%" : "") +
+    "\nVault balance: " + ethers.formatEther(bal) + " ETH" +
+    "\nTriggered now: " + (triggered ? "YES" : "no") +
+    "\nExecuted: " + (executed ? "YES — funds moved to USDC" : "no");
+}
+$("refreshBtn").onclick = refreshStatus;
+</script>
+</body>
+</html>
